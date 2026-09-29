@@ -1,0 +1,154 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Profiles: any signed-in user can browse, only you can edit yours.
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow create, update, delete: if request.auth != null && request.auth.uid == userId;
+
+      // In-app notifications: only the owner reads/clears them; anyone
+      // signed in may create one, but must truthfully identify themselves.
+      match /notifications/{notifId} {
+        allow read, update, delete: if request.auth != null && request.auth.uid == userId;
+        allow create: if request.auth != null
+          && request.resource.data.fromId == request.auth.uid;
+      }
+
+      // My private relationship labels (friend/bestie/close/pin) — only I touch mine.
+      match /relationships/{otherId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // My block list — only I manage mine; anyone signed in may READ a block
+      // doc keyed by their own id (so the app can check "did they block me").
+      match /blocks/{otherId} {
+        allow read: if request.auth != null
+          && (request.auth.uid == userId || request.auth.uid == otherId);
+        allow write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // My saved posts — private to me.
+      match /saved/{postId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // My muted chats/groups — private to me.
+      match /mutes/{targetId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // My pinned chats/groups (works for either DMs or group ids) — private
+      // to me, same as mutes.
+      match /pins/{targetId} {
+        allow read, write: if request.auth != null && request.auth.uid == userId;
+      }
+
+      // Friend connections. I manage my own doc; another signed-in user may
+      // write the mirrored doc under my tree when sending/accepting/removing.
+      match /friends/{otherId} {
+        allow read: if request.auth != null
+          && (request.auth.uid == userId || request.auth.uid == otherId);
+        allow write: if request.auth != null
+          && (request.auth.uid == userId || request.auth.uid == otherId);
+      }
+    }
+
+    // Likes ("swipes"): doc id is "<swiperId>_<targetId>". Anyone signed in
+    // can read (needed for mutual-like check); you can only write your own.
+    match /swipes/{swipeId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.swiperId == request.auth.uid
+        && swipeId == request.auth.uid + '_' + request.resource.data.targetId;
+    }
+
+    // Feed posts: everyone signed in can read; only the author can create,
+    // edit, or delete; anyone signed in may touch ONLY reactions/commentCount.
+    match /posts/{postId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.authorId == request.auth.uid;
+      allow update: if request.auth != null && (
+        resource.data.authorId == request.auth.uid
+        || request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['reactions', 'commentCount'])
+      );
+      allow delete: if request.auth != null
+        && resource.data.authorId == request.auth.uid;
+
+      match /comments/{commentId} {
+        allow read: if request.auth != null;
+        allow create: if request.auth != null
+          && request.resource.data.authorId == request.auth.uid;
+        allow update: if request.auth != null && (
+          resource.data.authorId == request.auth.uid
+          || request.resource.data.diff(resource.data).affectedKeys().hasOnly(['reactions'])
+        );
+        allow delete: if request.auth != null
+          && resource.data.authorId == request.auth.uid;
+      }
+    }
+
+    // Public groups: any signed-in user can read groups, join (write their own
+    // membership doc), and post messages. Group docs are creatable by anyone
+    // signed in (used for seeding + user-created groups).
+    match /groups/{groupId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null;
+
+      match /members/{memberId} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null && request.auth.uid == memberId;
+      }
+
+      match /messages/{messageId} {
+        allow read: if request.auth != null;
+        allow create: if request.auth != null
+          && request.resource.data.senderId == request.auth.uid;
+      }
+    }
+
+    // Reports: anyone signed in can file one; nobody reads them from the app
+    // (admin reviews in the Firebase console).
+    match /reports/{reportId} {
+      allow create: if request.auth != null
+        && request.resource.data.reportedBy == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    // Chats (collection kept as "matches" for compatibility): open
+    // messaging — any signed-in user may start a chat with anyone, no
+    // friend request or matching required. Only the two participants can
+    // read or write inside it.
+    match /matches/{matchId} {
+      // resource is null when the document doesn't exist yet (e.g. the very
+      // first read before a brand-new chat is created) — reading a
+      // non-existent doc must be allowed (there's no data to protect), or
+      // Firestore throws "Missing or insufficient permissions" even though
+      // nothing is actually being exposed.
+      allow read: if request.auth != null
+        && (resource == null || request.auth.uid in resource.data.users);
+      allow update: if request.auth != null
+        && resource.data.users is list
+        && request.auth.uid in resource.data.users;
+      allow create: if request.auth != null
+        && request.auth.uid in request.resource.data.users;
+
+      match /messages/{messageId} {
+        allow read: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.users;
+        allow create: if request.auth != null
+          && request.resource.data.senderId == request.auth.uid
+          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.users;
+        // Only the RECIPIENT (a participant who did not send it) may mark a
+        // message delivered — and only that one field, so nobody can edit
+        // another person's message content or sender.
+        allow update: if request.auth != null
+          && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.users
+          && request.auth.uid != resource.data.senderId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['delivered']);
+      }
+    }
+  }
+}
